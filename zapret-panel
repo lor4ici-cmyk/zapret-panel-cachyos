@@ -1,0 +1,647 @@
+#!/usr/bin/python3
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryFile
+from threading import Event
+
+sys.path.append("/usr/local/lib/zapret-panel")
+from zapret_panel_probes import Probes, Report, discord_rtc_report
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk
+
+
+APP_ID = "io.github.zapret-panel"
+ICON_PATH = Path(f"/usr/share/icons/hicolor/128x128/apps/{APP_ID}.png")
+SONAR = "/opt/zapret/zapret-sonar/zapret-sonar"
+CUSTOM_VERSION = "1.10.4"
+CUSTOM_ROOT = Path(f"/opt/zapret/zapret-panel-custom/{CUSTOM_VERSION}")
+CONFIG = Path("/opt/zapret/config")
+ADMIN = ["/usr/bin/pkexec", "--disable-internal-agent", "/usr/local/bin/zapret-panel-admin"]
+AGENT = Path("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
+STATUS = {
+    "active": "Включено",
+    "inactive": "Выключено",
+    "failed": "Ошибка службы",
+    "activating": "Запускается",
+    "deactivating": "Останавливается",
+}
+CSS = b"""
+window { background: #16121f; color: #f2ecff; }
+.panel { background: #241d32; border: 1px solid #55436e; border-radius: 18px; }
+.title { font-size: 27px; font-weight: 700; color: #e8d8ff; }
+.section { font-size: 13px; font-weight: 700; color: #dac4ff; }
+.muted { color: #bfb0d0; }
+.on { color: #b9e9cd; font-weight: 700; }
+.off { color: #d8c6ef; font-weight: 700; }
+.failed { color: #ffadbc; font-weight: 700; }
+button, combobox button {
+    background-image: none; background-color: #30263f; color: #f2ecff;
+    border: 1px solid #66517f; border-radius: 10px; text-shadow: none;
+    padding: 6px 10px;
+}
+button:hover, combobox button:hover { background-color: #433253; border-color: #9c79c6; }
+button:disabled { color: #9e91ab; background-color: #292236; border-color: #40344f; }
+combobox { background: #30263f; border-radius: 10px; }
+combobox window, menu { background: #241d32; color: #f2ecff; }
+menuitem:hover { background: #433253; }
+switch { background-color: #423552; border-color: #66517f; }
+switch:checked { background-color: #ba95ed; border-color: #ba95ed; }
+button.action {
+    background-image: none; background-color: #c5a4f3; color: #211629;
+    border: 1px solid #d9bbff; border-radius: 10px; text-shadow: none; font-weight: 700;
+}
+button.action:hover { background-color: #dfc4ff; }
+button.action:disabled { background-color: #393047; color: #aa9ab9; border-color: #393047; }
+window.scan-dialog { background: #1c1727; }
+treeview, textview, textview text { background-color: #211b2d; color: #f2ecff; }
+treeview:selected { background-color: #654c84; }
+progressbar trough { min-height: 5px; background-color: #352b44; }
+progressbar progress { min-height: 5px; background-color: #c5a4f3; }
+progressbar text { color: #e4d7f5; }
+"""
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    service: str
+    strategy: str
+    autostart: str
+    versions: str
+    profiles: tuple
+    can_rollback: bool
+
+
+def run(args):
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith(("ZF_", "_ZF_", "BASH_FUNC_")) or key in ("BASH_ENV", "ENV"):
+            env.pop(key)
+    env.update(PATH="/usr/bin:/usr/sbin:/bin", LC_ALL="C.UTF-8")
+    return subprocess.run(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", env=env, check=False,
+    )
+
+
+def read_sonar(*args):
+    result = run([SONAR, *args])
+    if result.returncode:
+        raise RuntimeError(result.stdout.strip() or "Ошибка чтения состояния Zapret.")
+    return result.stdout.strip()
+
+
+def profile_label(profile):
+    if not profile:
+        return ""
+    custom = profile.startswith("custom:")
+    name = profile.removeprefix("custom:")
+    title = "General" if name == "general.bat" else name.removesuffix(".bat").removeprefix("general ").strip("()")
+    return f"Custom · {title}" if custom else title
+
+
+def read_snapshot():
+    data = json.loads(read_sonar("status", "--json"))
+    profiles = tuple(p for p in read_sonar("_list").splitlines() if p.endswith(".bat"))
+    try:
+        custom = tuple(f"custom:{p}" for p in (CUSTOM_ROOT / "valid.txt").read_text().splitlines() if p.endswith(".bat"))
+    except FileNotFoundError:
+        custom = ()
+    strategy = data["strategy"]
+    if strategy and CONFIG.is_file() and f"{CUSTOM_ROOT}/" in CONFIG.read_text(errors="replace"):
+        strategy = f"custom:{strategy}"
+    snapshots = json.loads(read_sonar("snapshots", "--json"))["snapshots"]
+    version = data["zapret"] or "—"
+    if version.startswith("github version ") and len(version.split()) >= 3:
+        version = version.split()[2]
+    versions = f"Flowseal {data['flowseal'] or '—'} · Zapret {version} · Sonar {data['sonar_version']}"
+    if custom:
+        versions += f"\nCustom {CUSTOM_VERSION} · {len(custom)} проф."
+    return Snapshot(
+        data["service_state"], strategy, read_sonar("_state", "autostart"),
+        versions, profiles + custom, len(snapshots) > 1,
+    )
+
+
+def label(text="", style=None):
+    item = Gtk.Label(label=text, xalign=0)
+    if style:
+        item.get_style_context().add_class(style)
+    return item
+
+
+def box(vertical=True, spacing=9):
+    return Gtk.Box(
+        orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
+        spacing=spacing,
+    )
+
+
+class ScanDialog(Gtk.Dialog):
+    def __init__(self, owner):
+        super().__init__(title="Проверка профилей", transient_for=owner, modal=True)
+        self.owner = owner
+        self.cancel = Event()
+        self.running = False
+        self.total = 0
+        self.count = 0
+        self.set_default_size(790, 570)
+        self.get_style_context().add_class("scan-dialog")
+        self.connect("delete-event", self.close_requested)
+        content = box(spacing=10)
+        content.set_border_width(14)
+        self.get_content_area().add(content)
+        content.add(label("YouTube и Discord", "title"))
+        hint = label("Сначала проверка без Zapret, затем профили по очереди. Звонки и загрузки могут прерваться. "
+                     "После проверки вернутся исходный профиль и состояние службы.", "muted")
+        hint.set_line_wrap(True)
+        content.add(hint)
+
+        options = box(False)
+        self.launch_buttons = []
+        scopes = [("Выбранный", ["one", owner.profiles.get_active_id()]), ("Все", ["all"])]
+        if any(p.startswith("custom:") for p in owner.snapshot.profiles):
+            scopes.insert(1, ("Только Custom", ["custom"]))
+        for title, args in scopes:
+            button = Gtk.Button(label=title)
+            button.connect("clicked", self.start, args)
+            self.launch_buttons.append(button)
+            options.add(button)
+        self.cancel_button = Gtk.Button(label="Остановить тест")
+        self.cancel_button.connect("clicked", self.cancel_requested)
+        self.cancel_button.set_sensitive(False)
+        options.pack_end(self.cancel_button, False, False, 0)
+        content.add(options)
+
+        self.progress = Gtk.ProgressBar(show_text=True)
+        self.progress.set_text("Выберите, какие профили проверить")
+        content.add(self.progress)
+        self.results = Gtk.ListStore(str, str, str, str, str, str)
+        self.table = Gtk.TreeView(model=self.results)
+        for index, title in enumerate(("Профиль", "YouTube", "Discord", "Итог")):
+            column = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=index)
+            column.set_min_width((178, 160, 190, 125)[index])
+            column.set_resizable(True)
+            self.table.append_column(column)
+        self.table.get_selection().connect("changed", self.show_result)
+        scroll = Gtk.ScrolledWindow(min_content_height=160)
+        scroll.add(self.table)
+        content.pack_start(scroll, True, True, 0)
+
+        self.detail = Gtk.TextView(editable=False, cursor_visible=False)
+        self.detail.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.detail.set_left_margin(7)
+        detail_scroll = Gtk.ScrolledWindow(min_content_height=145)
+        detail_scroll.add(self.detail)
+        content.pack_start(detail_scroll, True, True, 0)
+
+        bottom = box(False)
+        self.choose = Gtk.Button(label="Выбрать этот профиль")
+        self.choose.set_sensitive(False)
+        self.choose.connect("clicked", self.choose_profile)
+        bottom.add(self.choose)
+        self.rtc = Gtk.Button(label="Отчёт демки Discord…")
+        self.rtc.connect("clicked", self.open_rtc_report)
+        bottom.add(self.rtc)
+        close = Gtk.Button(label="Закрыть")
+        close.connect("clicked", lambda *_: self.close_requested())
+        bottom.pack_end(close, False, False, 0)
+        content.add(bottom)
+        self.show_all()
+
+    def open_rtc_report(self, _button):
+        dialog = Gtk.FileChooserDialog(
+            title="Отчёт демки Discord", transient_for=self, action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Открыть", Gtk.ResponseType.ACCEPT)
+        hint = label("Открой chrome://webrtc-internals перед просмотром демки в веб-Discord. "
+                     "Выключи камеры, оставь открытой только нужную трансляцию на 10–15 секунд "
+                     "и скачай обычный dump WebRTC Internals. Файл читается локально.", "muted")
+        hint.set_line_wrap(True)
+        hint.show()
+        dialog.set_extra_widget(hint)
+        response = dialog.run()
+        path = dialog.get_filename()
+        dialog.destroy()
+        if response == Gtk.ResponseType.ACCEPT and path:
+            try:
+                result = discord_rtc_report(Path(path))
+            except (ValueError, OSError, EOFError) as exc:
+                result = f"Отчёт не удалось прочитать. {exc}"
+            self.detail.get_buffer().set_text(f"Результат сессии Discord\n\n{result}")
+
+    def show_result(self, selection):
+        model, row = selection.get_selected()
+        self.detail.get_buffer().set_text(model[row][4] if row is not None else "")
+        self.choose.set_sensitive(row is not None and not self.running and bool(model[row][5]))
+
+    def choose_profile(self, _button):
+        model, row = self.table.get_selection().get_selected()
+        if row is not None and model[row][5]:
+            self.owner.profiles.set_active_id(model[row][5])
+            self.destroy()
+
+    def close_requested(self, *_args):
+        if self.running:
+            self.cancel_requested()
+        else:
+            self.destroy()
+        return True
+
+    def cancel_requested(self, *_args):
+        self.cancel.set()
+        self.cancel_button.set_sensitive(False)
+        self.progress.set_text("Завершаем текущую проверку и возвращаем настройки…")
+
+    def start(self, _button, args):
+        self.cancel.clear()
+        self.running = self.owner.busy = True
+        self.count = self.total = 0
+        self.results.clear()
+        self.owner.update_controls()
+        self.choose.set_sensitive(False)
+        self.cancel_button.set_sensitive(True)
+        self.rtc.set_sensitive(False)
+        for button in self.launch_buttons:
+            button.set_sensitive(False)
+        self.progress.set_fraction(0)
+        self.progress.set_text("Ожидаем подтверждение администратора…")
+        self.owner.with_agent(self.owner.submit, lambda: self.scan(args), self.finished)
+
+    def scanning(self, profile):
+        if not self.cancel.is_set():
+            title = "Без Zapret" if profile == "BASELINE" else profile_label(profile)
+            self.progress.set_text(f"{self.count + 1} / {self.total} · {title}")
+
+    def add_result(self, profile, report):
+        title = "Без Zapret" if profile == "BASELINE" else profile_label(profile)
+        row = self.results.append((
+            title, report.youtube, report.discord, report.summary,
+            report.details, "" if profile == "BASELINE" else profile,
+        ))
+        if self.count == 0:
+            self.table.get_selection().select_iter(row)
+        self.count += 1
+        self.progress.set_fraction(self.count / max(self.total, 1))
+
+    def scan(self, args):
+        probes = Probes()
+        restored = False
+        with TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as log:
+            with subprocess.Popen(
+                ADMIN + ["scan", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log, text=True, encoding="utf-8", errors="replace", bufsize=1,
+            ) as process:
+                try:
+                    for line in process.stdout:
+                        event, _, value = line.rstrip("\n").partition("\t")
+                        if event == "TOTAL":
+                            self.total = int(value)
+                        elif event == "TRY":
+                            GLib.idle_add(self.scanning, value)
+                        elif event in ("CHECK", "FAILED"):
+                            value, _, reason = value.partition("\t")
+                            if not self.cancel.is_set():
+                                report = (probes.check() if event == "CHECK" else Report(
+                                    "—", "—", "Ошибка запуска",
+                                    reason or "Не удалось запустить службу с этим профилем.",
+                                ))
+                                GLib.idle_add(self.add_result, value, report)
+                            process.stdin.write("cancel\n" if self.cancel.is_set() else "next\n")
+                            process.stdin.flush()
+                        elif event == "RESTORED":
+                            restored = True
+                finally:
+                    try:
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                rc = process.wait()
+            log.seek(0)
+            return rc, restored, log.read()[-6000:]
+
+    def finished(self, future):
+        self.running = self.owner.busy = False
+        self.owner.update_controls()
+        self.owner.refresh()
+        self.cancel_button.set_sensitive(False)
+        self.rtc.set_sensitive(True)
+        for button in self.launch_buttons:
+            button.set_sensitive(True)
+        try:
+            rc, restored, log = future.result()
+        except (OSError, ValueError, RuntimeError) as exc:
+            rc, restored, log = 1, False, str(exc)
+        if rc == 0 and restored:
+            message = ("Проверка остановлена" if self.cancel.is_set()
+                       else f"Проверено профилей: {max(0, self.count - 1)}")
+            self.progress.set_text(f"{message}. Настройки возвращены.")
+        elif rc == 126:
+            self.progress.set_text("Подтверждение отменено.")
+        else:
+            self.progress.set_text("Проверка прервана. Смотри подробности.")
+        self.show_result(self.table.get_selection())
+        if rc and log:
+            self.detail.get_buffer().set_text(log)
+
+
+class Panel(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Zapret Panel")
+        self.set_default_size(525, 482)
+        self.set_icon_name(APP_ID)
+        if ICON_PATH.is_file():
+            self.set_icon_from_file(str(ICON_PATH))
+        self.snapshot = None
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.busy = False
+        self.reading = False
+        self.agent = None
+        self.closed = False
+        self.connect("delete-event", self.close_window)
+        self.connect("destroy", self.cleanup)
+
+        content = box(spacing=14)
+        content.set_border_width(22)
+        self.add(content)
+        header = box(False)
+        header.pack_start(label("Zapret Panel", "title"), True, True, 0)
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text("Перечитать статус")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        header.pack_end(refresh, False, False, 0)
+        content.add(header)
+
+        controls = self.card(content)
+        row = box(False)
+        self.status = label("Проверяем службу…", "off")
+        row.pack_start(self.status, True, True, 0)
+        self.applied = label("", "muted")
+        row.pack_end(self.applied, False, False, 0)
+        controls.add(row)
+
+        controls.add(label("Профиль Flowseal", "section"))
+        self.profiles = Gtk.ComboBoxText()
+        self.profiles.connect("changed", lambda *_: self.update_controls())
+        controls.add(self.profiles)
+
+        buttons = box(False)
+        self.apply_button = Gtk.Button(label="Включить")
+        self.apply_button.get_style_context().add_class("action")
+        self.apply_button.connect("clicked", self.apply_selected)
+        buttons.pack_start(self.apply_button, True, True, 0)
+        self.stop_button = Gtk.Button(label="Выключить")
+        self.stop_button.connect("clicked", lambda *_: self.execute("Останавливаем службу…", ADMIN + ["stop"]))
+        buttons.pack_start(self.stop_button, True, True, 0)
+        controls.add(buttons)
+
+        boot = box(False)
+        boot.pack_start(label("Запускать с системой"), True, True, 0)
+        self.autostart = Gtk.Switch()
+        self.autostart.set_valign(Gtk.Align.CENTER)
+        self.autostart.connect("state-set", self.set_autostart)
+        boot.pack_end(self.autostart, False, False, 0)
+        controls.add(boot)
+        self.scan_button = Gtk.Button(label="Проверить профили")
+        self.scan_button.connect("clicked", lambda *_: ScanDialog(self))
+        controls.add(self.scan_button)
+
+        maintenance = self.card(content)
+        maintenance.add(label("Обновления", "section"))
+        self.versions = label("Загружаем версии…", "muted")
+        self.versions.set_line_wrap(True)
+        maintenance.add(self.versions)
+        updates = box(False)
+        self.update_button = Gtk.Button(label="Обновить профили")
+        self.update_button.connect("clicked", lambda *_: self.execute("Проверяем релизы Flowseal…", ADMIN + ["update"]))
+        updates.pack_start(self.update_button, True, True, 0)
+
+        self.menu = Gtk.Menu()
+        for title, action in [
+            ("Обновить движок Zapret", "upgrade"),
+            ("Обновить zapret-sonar", "self-update"),
+            ("Вернуть предыдущие обычные профили", "rollback"),
+        ]:
+            item = Gtk.MenuItem(label=title)
+            item.connect("activate", self.update_component, action)
+            self.menu.append(item)
+            if action == "rollback":
+                self.rollback = item
+        self.menu.show_all()
+        self.more = Gtk.MenuButton(label="Ещё ▾", popup=self.menu)
+        updates.pack_start(self.more, False, False, 0)
+        maintenance.add(updates)
+
+        footer = box(False)
+        self.spinner = Gtk.Spinner()
+        footer.pack_start(self.spinner, False, False, 0)
+        self.message = label("Загружаем профили…", "muted")
+        self.message.set_line_wrap(True)
+        footer.pack_start(self.message, True, True, 0)
+        self.details = Gtk.Button(label="Подробности")
+        self.details.connect("clicked", self.show_details)
+        footer.pack_end(self.details, False, False, 0)
+        self.output = ""
+        content.pack_end(footer, False, False, 0)
+        self.update_controls()
+        self.refresh()
+        self.timer = GLib.timeout_add_seconds(5, self.refresh)
+        self.show_all()
+
+    def card(self, parent):
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.get_style_context().add_class("panel")
+        content = box()
+        content.set_border_width(14)
+        frame.add(content)
+        parent.add(frame)
+        return content
+
+    def submit(self, work, done):
+        future = self.executor.submit(work)
+        future.add_done_callback(lambda finished: GLib.idle_add(done, finished))
+
+    def refresh(self):
+        if not (self.closed or self.busy or self.reading):
+            self.reading = True
+            self.submit(read_snapshot, self.show_snapshot)
+        return not self.closed
+
+    def show_snapshot(self, future):
+        self.reading = False
+        if self.closed or self.busy:
+            return
+        try:
+            snapshot = future.result()
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            self.snapshot = None
+            self.status.set_text("Состояние недоступно")
+            self.versions.set_text("Проверьте установку Zapret Panel.")
+            self.message.set_text("Не удалось прочитать статус службы.")
+            self.output = str(error)
+            self.update_controls()
+            return
+
+        previous = self.snapshot
+        selected = self.profiles.get_active_id()
+        self.snapshot = snapshot
+        self.status.set_text(STATUS.get(snapshot.service, "Состояние неизвестно"))
+        style = self.status.get_style_context()
+        for name in ("on", "off", "failed"):
+            style.remove_class(name)
+        style.add_class({"active": "on", "failed": "failed"}.get(snapshot.service, "off"))
+        active_profile = profile_label(snapshot.strategy)
+        self.applied.set_text(f"Применён: {active_profile}" if active_profile else "Профиль не применён")
+        self.versions.set_text(snapshot.versions)
+        if previous is None or previous.profiles != snapshot.profiles:
+            self.profiles.remove_all()
+            for profile in snapshot.profiles:
+                self.profiles.append(profile, profile_label(profile))
+        if previous is None or previous.strategy != snapshot.strategy:
+            selected = snapshot.strategy or selected
+        if selected not in snapshot.profiles:
+            selected = snapshot.profiles[0] if snapshot.profiles else None
+        if selected:
+            self.profiles.set_active_id(selected)
+        enabled = snapshot.autostart in {"enabled", "enabled-runtime"}
+        self.autostart.handler_block_by_func(self.set_autostart)
+        self.autostart.set_active(enabled)
+        self.autostart.set_state(enabled)
+        self.autostart.handler_unblock_by_func(self.set_autostart)
+        if previous is None:
+            self.message.set_text("Выберите профиль и нажмите «Включить»." if snapshot.profiles else "Профили не найдены.")
+        self.update_controls()
+
+    def update_controls(self):
+        ready = self.snapshot is not None and not self.busy
+        active = ready and self.snapshot.service == "active"
+        selected = self.profiles.get_active_id()
+        self.apply_button.set_label("Применить профиль" if active else "Включить")
+        self.profiles.set_sensitive(ready)
+        self.apply_button.set_sensitive(bool(ready and selected and (not active or selected != self.snapshot.strategy)))
+        self.stop_button.set_sensitive(bool(ready and self.snapshot.service not in ("inactive", "")))
+        self.autostart.set_sensitive(bool(ready and (self.snapshot.strategy or self.autostart.get_active())))
+        self.scan_button.set_sensitive(bool(ready and selected))
+        self.update_button.set_sensitive(ready)
+        self.more.set_sensitive(ready)
+        self.rollback.set_sensitive(bool(ready and self.snapshot.can_rollback))
+        self.details.set_sensitive(bool(self.output))
+
+    def apply_selected(self, _button):
+        profile = self.profiles.get_active_id()
+        if profile:
+            self.execute(f"Применяем {profile_label(profile)}…", ADMIN + ["use", profile])
+
+    def set_autostart(self, _switch, enabled):
+        self.execute(
+            "Настраиваем запуск с системой…",
+            ADMIN + ["autostart-on" if enabled else "disable"],
+        )
+        return True
+
+    def update_component(self, _item, action):
+        self.execute("Выполняем обновление…" if action != "rollback" else "Возвращаем прошлые профили…", ADMIN + [action])
+
+    def execute(self, message, args):
+        if self.busy:
+            return
+        self.busy = True
+        self.output = ""
+        self.message.set_text(message)
+        self.spinner.start()
+        self.update_controls()
+        self.with_agent(self.submit_action, args)
+
+    def with_agent(self, callback, *args):
+        if AGENT.is_file() and (self.agent is None or self.agent.poll() is not None):
+            try:
+                self.agent = subprocess.Popen([str(AGENT)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            else:
+                # Give the fallback agent time to register with the session.
+                GLib.timeout_add(450, callback, *args)
+                return
+        callback(*args)
+
+    def submit_action(self, args):
+        self.submit(lambda: run(args), self.finish_action)
+        return False
+
+    def finish_action(self, future):
+        self.busy = False
+        self.spinner.stop()
+        try:
+            result = future.result()
+            self.output = result.stdout.strip()
+            messages = {
+                0: "Готово.",
+                126: "Подтверждение отменено.",
+                127: "Не удалось получить права администратора.",
+            }
+            self.message.set_text(messages.get(result.returncode, "Операция завершилась с ошибкой."))
+        except OSError as error:
+            self.output = str(error)
+            self.message.set_text("Не удалось запустить команду.")
+        self.update_controls()
+        self.refresh()
+
+    def show_details(self, _button):
+        dialog = Gtk.Dialog(title="Подробности", transient_for=self, modal=True)
+        dialog.add_button("Закрыть", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(520, 330)
+        view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.get_buffer().set_text(self.output)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(view)
+        dialog.get_content_area().pack_start(scroll, True, True, 8)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def close_window(self, *_):
+        if self.busy:
+            self.present()
+        return self.busy
+
+    def cleanup(self, *_):
+        self.closed = True
+        GLib.source_remove(self.timer)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        if self.agent is not None and self.agent.poll() is None:
+            self.agent.terminate()
+
+
+class Application(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        window = self.get_active_window()
+        if window is None:
+            Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+            window = Panel(self)
+        window.present()
+
+
+if __name__ == "__main__":
+    if os.geteuid() == 0:
+        raise SystemExit("Откройте Zapret Panel от обычного пользователя.")
+    GLib.set_prgname(APP_ID)
+    raise SystemExit(Application().run())
